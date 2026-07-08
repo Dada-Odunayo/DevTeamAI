@@ -61,8 +61,59 @@ class MemoryStore:
                 )
                 """
             )
+            self._ensure_columns(
+                conn,
+                "projects",
+                {
+                    "target_users": "TEXT",
+                    "platform": "TEXT",
+                    "artifacts_json": "TEXT NOT NULL DEFAULT '{}'",
+                    "conversation_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "score_json": "TEXT NOT NULL DEFAULT '{}'",
+                },
+            )
+            self._ensure_columns(
+                conn,
+                "staged_projects",
+                {
+                    "target_users": "TEXT",
+                    "platform": "TEXT",
+                    "current_stage": "TEXT NOT NULL DEFAULT 'decomposition'",
+                    "created_at": "TEXT NOT NULL DEFAULT ''",
+                    "updated_at": "TEXT NOT NULL DEFAULT ''",
+                    "score_json": "TEXT NOT NULL DEFAULT '{}'",
+                    "state_json": "TEXT NOT NULL DEFAULT '{}'",
+                },
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_keyword ON memories(keyword)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_staged_projects_updated_at ON staged_projects(updated_at)")
+
+    @staticmethod
+    def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    @staticmethod
+    def _json_object(value: str | None) -> dict[str, Any]:
+        if not value:
+            return {}
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _json_list(value: str | None) -> list[dict[str, Any]]:
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
 
     def save_project(
         self,
@@ -112,7 +163,7 @@ class MemoryStore:
                 "id": row["id"],
                 "idea": row["idea"],
                 "created_at": row["created_at"],
-                "score": json.loads(row["score_json"]),
+                "score": self._json_object(row["score_json"]),
             }
             for row in rows
         ]
@@ -128,9 +179,9 @@ class MemoryStore:
             "target_users": row["target_users"],
             "platform": row["platform"],
             "created_at": row["created_at"],
-            "artifacts": json.loads(row["artifacts_json"]),
-            "conversation": json.loads(row["conversation_json"]),
-            "score": json.loads(row["score_json"]),
+            "artifacts": self._json_object(row["artifacts_json"]),
+            "conversation": self._json_list(row["conversation_json"]),
+            "score": self._json_object(row["score_json"]),
         }
 
     def save_staged_project(self, project: dict[str, Any]) -> None:
@@ -185,7 +236,7 @@ class MemoryStore:
                 "current_stage": row["current_stage"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
-                "score": json.loads(row["score_json"]),
+                "score": self._json_object(row["score_json"]),
                 "type": "staged",
             }
             for row in rows
@@ -196,7 +247,7 @@ class MemoryStore:
             row = conn.execute("SELECT state_json FROM staged_projects WHERE id = ?", (project_id,)).fetchone()
         if row is None:
             return None
-        return json.loads(row["state_json"])
+        return self._json_object(row["state_json"]) or None
 
     def search_memory(self, idea: str, limit: int = 5) -> list[dict[str, Any]]:
         keywords = self._keywords(idea)

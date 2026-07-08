@@ -1,4 +1,5 @@
 import { getArtifact, getPath, isEmptyValue, isPlainObject, pickEntries } from '../../lib/report-utils';
+import { SectionTooltip } from '../Collapsible';
 import { AgentOutputCard } from './AgentOutputCard';
 import { BaselineComparisonPanel } from './BaselineComparisonPanel';
 import { DatabaseSchemaPanel } from './DatabaseSchemaPanel';
@@ -118,7 +119,13 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
   if (!hasAnyReportContent) {
     return (
       <article className="rounded-lg border border-dashed border-slate-300 bg-white px-5 py-6 text-center shadow-sm">
-        <h2 className="text-xl font-bold text-slate-950">Final Report</h2>
+        <div className="flex items-start justify-center gap-3">
+          <h2 className="text-xl font-bold text-slate-950">Final Report</h2>
+          <SectionTooltip
+            label="About Final Report"
+            text="The final report appears here after project stages produce structured planning outputs."
+          />
+        </div>
         <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-600">
           Run and approve stages to build the final report.
         </p>
@@ -127,31 +134,37 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
   }
 
   return (
-    <article className="space-y-4">
-      <header className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+    <article className="space-y-2">
+      <header className="rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-sm">
+        <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
           <div>
             <p className="text-xs font-semibold uppercase tracking-wide text-sky-700">Final Report</p>
-            <h1 className="mt-2 text-3xl font-bold tracking-tight text-slate-950">DevTeam AI Planning Report</h1>
-            <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">
+            <h1 className="mt-1 text-2xl font-bold tracking-tight text-slate-950">DevTeam AI Planning Report</h1>
+            <p className="mt-1 max-w-3xl text-sm leading-5 text-slate-600">
               Completed stage outputs are shown as accordions. Locked or unrun stages are hidden until they produce content.
             </p>
           </div>
-          {exportHref && (
-            <a
-              className="inline-flex items-center justify-center rounded-lg bg-slate-950 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800"
-              href={exportHref}
-            >
-              Export Deliverables
-            </a>
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <SectionTooltip
+              label="About Final Report"
+              text="Collects every approved or generated artifact into a readable report. Use the accordions to inspect each stage output."
+            />
+            {exportHref && (
+              <a
+                className="inline-flex items-center justify-center rounded-lg bg-slate-950 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800"
+                href={exportHref}
+              >
+                Export Deliverables
+              </a>
+            )}
+          </div>
         </div>
       </header>
 
       {(hasValue(prd) || hasValue(score)) && (
         <ReportSection
           collapsible
-          defaultExpanded={expandedStageName === 'prd' || expandedStageName === 'decomposition'}
+          defaultExpanded={false}
           description="The project at a glance, with current stage score and recommendation."
           eyebrow="Summary"
           title="Executive Summary"
@@ -182,7 +195,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         <ReportSection
           agentName={decompositionStage?.assigned_agent}
           collapsible
-          defaultExpanded={expandedStageName === 'decomposition'}
+          defaultExpanded={false}
           status={decompositionStage?.status}
           title="Task Decomposition"
           version={decompositionStage?.version}
@@ -203,7 +216,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         <ReportSection
           agentName={prdStage?.assigned_agent}
           collapsible
-          defaultExpanded={expandedStageName === 'prd'}
+          defaultExpanded={false}
           status={prdStage?.status}
           title="Product Requirements"
           version={prdStage?.version}
@@ -229,7 +242,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         <ReportSection
           agentName={architectureStage?.assigned_agent}
           collapsible
-          defaultExpanded={expandedStageName === 'architecture'}
+          defaultExpanded={false}
           status={architectureStage?.status}
           title="Architecture"
           version={architectureStage?.version}
@@ -257,7 +270,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         <ReportSection
           agentName={backendStage?.assigned_agent}
           collapsible
-          defaultExpanded={expandedStageName === 'backend_plan'}
+          defaultExpanded={false}
           status={backendStage?.status}
           title="Backend Plan"
           version={backendStage?.version}
@@ -282,7 +295,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         <ReportSection
           agentName={frontendStage?.assigned_agent}
           collapsible
-          defaultExpanded={expandedStageName === 'frontend_plan'}
+          defaultExpanded={false}
           status={frontendStage?.status}
           title="Frontend Plan"
           version={frontendStage?.version}
@@ -314,7 +327,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         <ReportSection
           agentName={qaStage?.assigned_agent}
           collapsible
-          defaultExpanded={expandedStageName === 'qa_plan'}
+          defaultExpanded={false}
           status={qaStage?.status}
           title="QA Plan"
           version={qaStage?.version}
@@ -341,7 +354,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         <ReportSection
           agentName={ctoStage?.assigned_agent}
           collapsible
-          defaultExpanded={expandedStageName === 'cto_review'}
+          defaultExpanded={false}
           status={ctoStage?.status}
           title="CTO Review"
           version={ctoStage?.version}
@@ -373,7 +386,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         <ReportSection
           agentName={negotiationStage?.assigned_agent}
           collapsible
-          defaultExpanded={expandedStageName === 'negotiation'}
+          defaultExpanded={false}
           status={negotiationStage?.status}
           title="Negotiation Decisions"
           version={negotiationStage?.version}
@@ -396,7 +409,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         <ReportSection
           agentName={revisionStage?.assigned_agent}
           collapsible
-          defaultExpanded={expandedStageName === 'revision_summary'}
+          defaultExpanded={false}
           status={revisionStage?.status}
           title="Revision Summary"
           version={revisionStage?.version}
@@ -417,7 +430,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         <ReportSection
           agentName={codeGenerationStage?.assigned_agent}
           collapsible
-          defaultExpanded={expandedStageName === 'code_generation'}
+          defaultExpanded={false}
           status={codeGenerationStage?.status}
           title="Code Generation"
           version={codeGenerationStage?.version}
@@ -436,7 +449,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         <ReportSection
           agentName={codeReviewStage?.assigned_agent}
           collapsible
-          defaultExpanded={expandedStageName === 'code_review'}
+          defaultExpanded={false}
           status={codeReviewStage?.status}
           title="Code Review"
           version={codeReviewStage?.version}
@@ -457,7 +470,7 @@ export function ReportLayout({ result, apiBaseUrl, expandedStageName, requestCon
         </ReportSection>
       )}
 
-      {Boolean(baseline) && <BaselineComparisonPanel baseline={baseline} devteamScore={score} />}
+      {Boolean(baseline) && <BaselineComparisonPanel baseline={baseline} defaultExpanded={false} devteamScore={score} />}
 
       <ReportSection collapsible defaultExpanded={false} title="Additional Agent Details">
         <AgentOutputCard title="Product extras" value={Object.fromEntries(pickEntries(prd, ['agent', 'assumptions']))} />

@@ -82,6 +82,7 @@ Edit `backend/.env`:
 QWEN_API_KEY=your_qwen_or_dashscope_api_key
 QWEN_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 QWEN_MODEL=qwen-plus
+QWEN_TIMEOUT_SECONDS=180
 APP_ENV=local
 DATABASE_PATH=data/devteam.sqlite
 ```

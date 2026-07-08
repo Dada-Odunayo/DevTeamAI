@@ -8,7 +8,13 @@ class QwenClient:
     def __init__(self, settings: Settings):
         self.settings = settings
 
-    async def chat_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
+    async def chat_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.2,
+        timeout_seconds: int | None = None,
+    ) -> str:
         if not self.settings.qwen_api_key or self.settings.qwen_api_key == "replace_me":
             raise RuntimeError("QWEN_API_KEY is missing. Add it to backend/.env")
 
@@ -27,7 +33,8 @@ class QwenClient:
             "Content-Type": "application/json",
         }
 
-        timeout = httpx.Timeout(self.settings.qwen_timeout_seconds)
+        effective_timeout_seconds = timeout_seconds or self.settings.qwen_timeout_seconds
+        timeout = httpx.Timeout(effective_timeout_seconds)
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(url, headers=headers, json=payload)
@@ -35,7 +42,7 @@ class QwenClient:
                 body = response.json()
         except httpx.TimeoutException as exc:
             raise RuntimeError(
-                f"Qwen request timed out after {self.settings.qwen_timeout_seconds} seconds"
+                f"Qwen request timed out after {effective_timeout_seconds} seconds"
             ) from exc
         except httpx.HTTPStatusError as exc:
             raise RuntimeError(

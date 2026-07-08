@@ -6,9 +6,10 @@ import { ReportSection } from './ReportSection';
 type BaselineComparisonPanelProps = {
   baseline: unknown;
   devteamScore: unknown;
+  defaultExpanded?: boolean;
 };
 
-export function BaselineComparisonPanel({ baseline, devteamScore }: BaselineComparisonPanelProps) {
+export function BaselineComparisonPanel({ baseline, devteamScore, defaultExpanded = false }: BaselineComparisonPanelProps) {
   const isComparison = isPlainObject(baseline) && isPlainObject(getPath(baseline, ['single_agent']));
   const singleAgent = isComparison ? getPath(baseline, ['single_agent']) : baseline;
   const multiAgent = isComparison ? getPath(baseline, ['multi_agent']) : null;
@@ -36,6 +37,8 @@ export function BaselineComparisonPanel({ baseline, devteamScore }: BaselineComp
 
   return (
     <ReportSection
+      collapsible
+      defaultExpanded={defaultExpanded}
       eyebrow="I"
       title="Baseline Comparison"
       description="Comparison between the single-agent baseline and the coordinated DevTeam AI workflow."

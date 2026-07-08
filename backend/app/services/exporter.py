@@ -5,6 +5,8 @@ import json
 import zipfile
 from typing import Any
 
+from app.services.generated_scaffold import ensure_runnable_generated_files
+
 
 def _as_list_md(items: Any) -> str:
     if not items:
@@ -54,7 +56,8 @@ def project_markdown(project: dict[str, Any]) -> dict[str, str]:
 
 def project_zip_bytes(project: dict[str, Any]) -> bytes:
     files = project_markdown(project)
-    for file in project.get("generated_files", []):
+    generated_files = [file for file in project.get("generated_files", []) if isinstance(file, dict)]
+    for file in ensure_runnable_generated_files(generated_files):
         if not isinstance(file, dict):
             continue
         path = file.get("path")
