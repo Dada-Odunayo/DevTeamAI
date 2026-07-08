@@ -13,7 +13,7 @@ services:
     build: ./frontend
     restart: unless-stopped
     environment:
-      - NEXT_PUBLIC_API_BASE_URL=/api/backend
+      - NEXT_PUBLIC_API_BASE_URL=/api
       - BACKEND_INTERNAL_URL=http://backend:8000
     ports:
       - "80:3000"

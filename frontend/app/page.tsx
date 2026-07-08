@@ -5,9 +5,8 @@ import { CollapsibleCard, SectionTooltip, StageAccordion } from '../components/C
 import { ErrorState } from '../components/report/ErrorState';
 import { ReportLayout } from '../components/report/ReportLayout';
 
-const DEFAULT_BACKEND_URL = 'http://127.0.0.1:8000';
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || '/api/backend';
-const STREAM_API_BASE_URL = API_BASE_URL.startsWith('/') ? DEFAULT_BACKEND_URL : API_BASE_URL;
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || '/api';
+const STREAM_API_BASE_URL = API_BASE_URL;
 const REQUEST_TIMEOUT_MS = 30_000;
 const STAGE_RUN_TIMEOUT_MS = 300_000;
 const HISTORY_BATCH_SIZE = 8;
