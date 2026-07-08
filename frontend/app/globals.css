@@ -7,3 +7,19 @@
 body {
   background: #f8fafc;
 }
+
+button:not(:disabled) {
+  cursor: pointer;
+  cursor: hand;
+}
+
+a[href],
+summary,
+[role="button"]:not([aria-disabled="true"]) {
+  cursor: pointer;
+}
+
+button:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed;
+}

@@ -1,12 +1,16 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { CollapsibleCard, SectionTooltip, StageAccordion } from '../components/Collapsible';
 import { ErrorState } from '../components/report/ErrorState';
 import { ReportLayout } from '../components/report/ReportLayout';
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://127.0.0.1:8000';
+const DEFAULT_BACKEND_URL = 'http://127.0.0.1:8000';
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || '/api/backend';
+const STREAM_API_BASE_URL = API_BASE_URL.startsWith('/') ? DEFAULT_BACKEND_URL : API_BASE_URL;
 const REQUEST_TIMEOUT_MS = 30_000;
-const STAGE_RUN_TIMEOUT_MS = 240_000;
+const STAGE_RUN_TIMEOUT_MS = 300_000;
+const HISTORY_BATCH_SIZE = 8;
 
 type StageStatus = 'locked' | 'running' | 'awaiting_approval' | 'approved' | 'needs_revision' | 'failed';
 
@@ -90,7 +94,7 @@ type UiEvent = {
 };
 
 const sampleIdea =
-  'Build a logistics POS system for delivery companies that supports wallet payments, cash collections, dispatch rider assignment, transaction history, settlement tracking, and offline mode.';
+  'Build a lightweight single-page task tracker for freelancers to add tasks, mark them complete, filter by status, and save everything in local browser storage.';
 
 const frontendStackOptions = [
   'Auto-select best stack',
@@ -161,6 +165,11 @@ function getDefaultExpandedStage(stages: Stage[]) {
   return running || getLatestCompletedStage(stages) || stages.find((stage) => stage.can_run) || stages[0] || null;
 }
 
+function isCardExpanded(cardId: string, activeCardId: string, expandedCards: Record<string, boolean>) {
+  if (expandedCards[cardId] !== undefined) return expandedCards[cardId];
+  return cardId === activeCardId;
+}
+
 function updateStageInProject(project: StagedProject, stageName: string, updates: Partial<Stage>): StagedProject {
   return {
     ...project,
@@ -169,9 +178,117 @@ function updateStageInProject(project: StagedProject, stageName: string, updates
   };
 }
 
+function stageStateAfterCancel(stage: Stage): Pick<Stage, 'status' | 'can_run'> {
+  if (stage.status === 'running') return { status: 'failed', can_run: true };
+  return { status: stage.status, can_run: stage.can_run };
+}
+
+function expandedCardsForLoadedProject(project: StagedProject, activeStageName: string) {
+  const expanded: Record<string, boolean> = {};
+  for (const stage of project.stages) {
+    expanded[`stage:${stage.name}`] = stage.name === activeStageName;
+  }
+  expanded.dialogue = false;
+  expanded.conflicts = false;
+  expanded.baseline = false;
+  expanded.code = false;
+  return expanded;
+}
+
+function extractErrorDetail(value: unknown): string | null {
+  if (typeof value === 'string') return value;
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.detail === 'string') return record.detail;
+  if (Array.isArray(record.detail)) return record.detail.map((item) => extractErrorDetail(item) || JSON.stringify(item)).join('; ');
+  if (record.detail && typeof record.detail === 'object') return extractErrorDetail(record.detail);
+  if (typeof record.message === 'string') return record.message;
+  if (typeof record.msg === 'string') return record.msg;
+  if (typeof record.error === 'string') return record.error;
+  return null;
+}
+
+function normalizeErrorText(message: string): string {
+  const trimmed = message.trim();
+  if (!trimmed) return trimmed;
+  const stageFailedPrefix = 'Stage failed:';
+  if (trimmed.startsWith(stageFailedPrefix)) {
+    const normalized = normalizeErrorText(trimmed.slice(stageFailedPrefix.length));
+    return normalized || trimmed;
+  }
+  const statusPrefixMatch = trimmed.match(/^\d{3}:\s*([\s\S]+)$/);
+  if (statusPrefixMatch) {
+    const normalized = normalizeErrorText(statusPrefixMatch[1]);
+    return normalized || trimmed;
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    return extractErrorDetail(parsed) || trimmed;
+  } catch {
+    // Some server/runtime errors embed JSON inside a larger string.
+  }
+  const jsonMatch = trimmed.match(/(\{[\s\S]*\})/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[1]);
+      const detail = extractErrorDetail(parsed);
+      if (detail) return detail;
+    } catch {
+      // Keep falling through to regex extraction.
+    }
+  }
+  const detailMatch = trimmed.match(/["']detail["']\s*:\s*["']([^"']+)["']/);
+  if (detailMatch) return detailMatch[1];
+  const messageMatch = trimmed.match(/["']message["']\s*:\s*["']([^"']+)["']/);
+  if (messageMatch) return messageMatch[1];
+  return trimmed;
+}
+
+async function responseErrorMessage(response: Response, path: string) {
+  const contentType = response.headers.get('content-type') || '';
+  const fallback = `Backend API returned ${response.status} for ${path}. Check the FastAPI terminal logs for the traceback.`;
+  try {
+    if (contentType.includes('application/json')) {
+      const detail = extractErrorDetail(await response.json());
+      return detail ? normalizeErrorText(detail) : fallback;
+    }
+    const text = (await response.text()).trim();
+    if (!text || text === 'Internal Server Error') return fallback;
+    return normalizeErrorText(text);
+  } catch {
+    return fallback;
+  }
+}
+
+function linkedAbortSignal(timeoutMs: number, externalSignal?: AbortSignal) {
+  const controller = new AbortController();
+  const abortFromExternal = () => controller.abort(externalSignal?.reason);
+  if (externalSignal?.aborted) {
+    controller.abort(externalSignal.reason);
+  } else {
+    externalSignal?.addEventListener('abort', abortFromExternal, { once: true });
+  }
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      window.clearTimeout(timeoutId);
+      externalSignal?.removeEventListener('abort', abortFromExternal);
+    },
+  };
+}
+
 function errorMessage(error: unknown, fallback: string) {
   if (error instanceof DOMException && error.name === 'AbortError') return fallback;
-  if (error instanceof Error) return error.message;
+  if (error instanceof TypeError && error.message.toLowerCase().includes('fetch')) {
+    return 'Could not reach the backend API. Start the FastAPI server on port 8000, then retry.';
+  }
+  if (error instanceof Error) {
+    if (error.message.toLowerCase().includes('failed to fetch')) {
+      return 'Could not reach the backend API. Start the FastAPI server on port 8000, then retry.';
+    }
+    return normalizeErrorText(error.message);
+  }
   return fallback;
 }
 
@@ -196,6 +313,24 @@ function formatDate(timestamp?: string | null) {
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return timestamp;
   return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = useState(false);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia(query);
+    setMatches(mediaQuery.matches);
+
+    function handleChange(event: MediaQueryListEvent) {
+      setMatches(event.matches);
+    }
+
+    mediaQuery.addEventListener('change', handleChange);
+    return () => mediaQuery.removeEventListener('change', handleChange);
+  }, [query]);
+
+  return matches;
 }
 
 function statusStyles(status: StageStatus | string) {
@@ -254,11 +389,16 @@ function FormattedValue({ value }: { value: unknown }) {
 }
 
 function ActivityTimeline({ events }: { events: UiEvent[] }) {
+  const tooltip = 'Shows real-time workflow events, agent messages, stage starts, completions, and failures as the project runs.';
+
   return (
     <details className="rounded-lg border border-slate-200 bg-white p-4 text-sm shadow-sm">
-      <summary className="cursor-pointer font-semibold text-slate-800">
-        <p className="text-xs font-semibold uppercase tracking-wide text-sky-700">Live workspace</p>
-        <span className="mt-1 block text-xl font-bold text-slate-950">Agent Activity</span>
+      <summary className="flex cursor-pointer items-start justify-between gap-3 font-semibold text-slate-800">
+        <span>
+          <p className="text-xs font-semibold uppercase tracking-wide text-sky-700">Live workspace</p>
+          <span className="mt-1 block text-xl font-bold text-slate-950">Agent Activity</span>
+        </span>
+        <SectionTooltip label="About Agent Activity" text={tooltip} />
       </summary>
       <div className="mt-4 space-y-3" aria-live="polite">
         {events.length === 0 && (
@@ -288,73 +428,275 @@ function ActivityTimeline({ events }: { events: UiEvent[] }) {
 function HistorySidebar({
   history,
   activeProjectId,
+  expanded,
+  hasLoaded,
+  hasMore,
+  totalCount,
   loading,
+  error,
   busy,
   onOpen,
+  onToggle,
   onRefresh,
+  onLoadMore,
 }: {
   history: ProjectHistoryItem[];
   activeProjectId?: string;
+  expanded: boolean;
+  hasLoaded: boolean;
+  hasMore: boolean;
+  totalCount: number;
   loading: boolean;
+  error: string;
   busy: boolean;
   onOpen: (projectId: string) => void;
+  onToggle: (expanded: boolean) => void;
   onRefresh: () => void;
+  onLoadMore: () => void;
 }) {
-  return (
-    <aside className="h-fit rounded-lg border border-slate-200 bg-white p-4 shadow-sm lg:sticky lg:top-6">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-sky-700">History</p>
-          <h2 className="mt-1 text-lg font-bold text-slate-950">Past Conversations</h2>
+  const status = loading ? 'loading' : error ? 'unavailable' : hasLoaded ? `${totalCount} saved` : 'not loaded';
+  const renderRefreshButton = () => (
+    <button
+      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+      disabled={loading || busy}
+      onClick={(event) => {
+        event.stopPropagation();
+        onRefresh();
+      }}
+      type="button"
+    >
+      Refresh
+    </button>
+  );
+
+  const content = (
+    <div className="space-y-2">
+      {loading && <p className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-4 text-sm text-slate-600">Loading conversations...</p>}
+      {!loading && !hasLoaded && !error && (
+        <p className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-4 text-sm text-slate-600">
+          History will load when this section opens.
+        </p>
+      )}
+      {!loading && error && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-4 text-sm text-amber-900">
+          <p className="font-semibold">History unavailable</p>
+          <p className="mt-1 leading-5">{error}</p>
         </div>
+      )}
+      {!loading && hasLoaded && !error && history.length === 0 && (
+        <p className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-4 text-sm text-slate-600">
+          Created projects will appear here.
+        </p>
+      )}
+      {history.map((item) => {
+        const score = item.score?.overall_score ?? item.score?.total_score;
+        const isActive = activeProjectId === item.id;
+        return (
+          <button
+            aria-current={isActive ? 'true' : undefined}
+            className={`relative w-full rounded-lg border px-3 py-3 text-left transition ${
+              isActive
+                ? 'border-indigo-600 bg-indigo-600 text-white shadow-md ring-2 ring-indigo-200'
+                : 'border-slate-200 bg-white hover:border-sky-300 hover:bg-sky-50'
+            }`}
+            disabled={busy && !isActive}
+            key={item.id}
+            onClick={() => onOpen(item.id)}
+            type="button"
+          >
+            {isActive && <div className="absolute left-0 top-0 h-full w-1 rounded-l-lg bg-white/80" />}
+            <div className="flex items-center justify-between gap-2">
+              <Badge
+                className={isActive ? 'border-white/30 bg-white/15 text-white' : statusStyles(item.current_stage ? 'awaiting_approval' : 'locked')}
+                label={item.type === 'quick_run' ? 'quick run' : 'staged'}
+              />
+              {score != null && <span className={`text-xs font-semibold ${isActive ? 'text-indigo-50' : 'text-slate-500'}`}>{String(score)}</span>}
+            </div>
+            <p className={`mt-2 line-clamp-3 text-sm font-semibold leading-5 ${isActive ? 'text-white' : 'text-slate-900'}`}>{item.idea}</p>
+            <div className={`mt-3 flex flex-wrap items-center gap-2 text-xs ${isActive ? 'text-indigo-100' : 'text-slate-500'}`}>
+              <span>{formatDate(item.updated_at || item.created_at)}</span>
+              {item.current_stage && <span>{stageLabels[item.current_stage] || item.current_stage}</span>}
+            </div>
+          </button>
+        );
+      })}
+      {hasMore && (
         <button
-          className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-sky-300 hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
           disabled={loading || busy}
-          onClick={onRefresh}
+          onClick={onLoadMore}
           type="button"
         >
-          Refresh
+          Load more
         </button>
+      )}
+    </div>
+  );
+
+  return (
+    <>
+      <div className="xl:hidden">
+        <CollapsibleCard
+          defaultExpanded={expanded}
+          onToggle={onToggle}
+          rightAction={renderRefreshButton()}
+          status={status}
+          subtitle="Past Conversations"
+          title="History"
+          tooltip="Browse previously created projects. Open one to continue reviewing its stages, outputs, files, and report."
+        >
+          {content}
+        </CollapsibleCard>
       </div>
-      <div className="mt-4 space-y-2">
-        {loading && <p className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-4 text-sm text-slate-600">Loading conversations...</p>}
-        {!loading && history.length === 0 && (
-          <p className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-4 text-sm text-slate-600">
-            Created projects will appear here.
-          </p>
-        )}
-        {history.map((item) => {
-          const score = item.score?.overall_score ?? item.score?.total_score;
-          const isActive = activeProjectId === item.id;
-          return (
+      <aside className="hidden h-fit rounded-lg border border-slate-200 bg-white p-4 shadow-sm xl:block">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-sky-700">History</p>
+            <h2 className="mt-1 text-lg font-bold text-slate-950">Past Conversations</h2>
+          </div>
+          <div className="flex items-center gap-2">
+            <SectionTooltip
+              label="About History"
+              text="Browse previously created projects. Open one to continue reviewing its stages, outputs, files, and report."
+            />
+            {renderRefreshButton()}
+          </div>
+        </div>
+        <div className="mt-4">{content}</div>
+      </aside>
+    </>
+  );
+}
+
+function ProjectSetupPanel({
+  idea,
+  targetUsers,
+  platform,
+  preferredFrontendStack,
+  constraints,
+  includeBaseline,
+  projectActive,
+  busy,
+  activeOperation,
+  error,
+  expanded,
+  setIdea,
+  setTargetUsers,
+  setPlatform,
+  setPreferredFrontendStack,
+  setConstraints,
+  setIncludeBaseline,
+  onCreateProject,
+  onCancel,
+  onToggle,
+}: {
+  idea: string;
+  targetUsers: string;
+  platform: string;
+  preferredFrontendStack: string;
+  constraints: string;
+  includeBaseline: boolean;
+  projectActive: boolean;
+  busy: boolean;
+  activeOperation: string;
+  error: string;
+  expanded: boolean;
+  setIdea: (value: string) => void;
+  setTargetUsers: (value: string) => void;
+  setPlatform: (value: string) => void;
+  setPreferredFrontendStack: (value: string) => void;
+  setConstraints: (value: string) => void;
+  setIncludeBaseline: (value: boolean) => void;
+  onCreateProject: () => void;
+  onCancel: () => void;
+  onToggle: (expanded: boolean) => void;
+}) {
+  return (
+    <div className="space-y-3">
+      <ErrorState message={error} />
+      <CollapsibleCard
+        defaultExpanded={expanded}
+        onToggle={onToggle}
+        status={error ? 'error' : projectActive ? 'project active' : 'ready'}
+        subtitle={projectActive ? 'Create a new project or adjust the next brief.' : 'Describe the product and start the staged workflow.'}
+        title="Project Setup"
+        tooltip="Enter the product brief, target users, platform, constraints, and optional baseline setting before creating a staged workflow."
+      >
+        <div className="space-y-4">
+          <label className="block">
+            <span className="text-sm font-semibold text-slate-800">Product idea</span>
+            <textarea
+              className="mt-2 min-h-32 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm leading-6 text-slate-900 shadow-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+              value={idea}
+              onChange={(event) => setIdea(event.target.value)}
+            />
+          </label>
+          <label className="block">
+            <span className="text-sm font-semibold text-slate-800">Target users</span>
+            <textarea
+              className="mt-2 min-h-20 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm leading-6 text-slate-900 shadow-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+              value={targetUsers}
+              onChange={(event) => setTargetUsers(event.target.value)}
+            />
+          </label>
+          <label className="block">
+            <span className="text-sm font-semibold text-slate-800">Platform</span>
+            <input
+              className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+              value={platform}
+              onChange={(event) => setPlatform(event.target.value)}
+            />
+          </label>
+          <label className="block">
+            <span className="text-sm font-semibold text-slate-800">Preferred frontend/mobile stack</span>
+            <select
+              className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+              value={preferredFrontendStack}
+              onChange={(event) => setPreferredFrontendStack(event.target.value)}
+            >
+              {frontendStackOptions.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="block">
+            <span className="text-sm font-semibold text-slate-800">Constraints, one per line</span>
+            <textarea
+              className="mt-2 min-h-24 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm leading-6 text-slate-900 shadow-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+              value={constraints}
+              onChange={(event) => setConstraints(event.target.value)}
+            />
+          </label>
+          <label className="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-800">
+            <input
+              className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+              type="checkbox"
+              checked={includeBaseline}
+              onChange={(event) => setIncludeBaseline(event.target.checked)}
+            />
+            Include single-agent baseline
+          </label>
+          <button
+            className="inline-flex w-full items-center justify-center rounded-lg bg-slate-950 px-4 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+            disabled={busy || idea.trim().length < 10}
+            onClick={onCreateProject}
+          >
+            {projectActive ? 'Create New Project' : 'Create Staged Project'}
+          </button>
+          {busy && activeOperation && (
             <button
-              className={`relative w-full rounded-lg border px-3 py-3 text-left transition ${
-                isActive
-                  ? 'border-sky-600 bg-sky-100 shadow-md ring-2 ring-sky-300'
-                  : 'border-slate-200 bg-white hover:border-sky-300 hover:bg-sky-50'
-              }`}
-              disabled={busy && !isActive}
-              key={item.id}
-              onClick={() => onOpen(item.id)}
+              className="inline-flex w-full items-center justify-center rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-semibold text-rose-800 shadow-sm transition hover:bg-rose-100"
+              onClick={onCancel}
               type="button"
             >
-              {isActive && (
-                <div className="absolute left-0 top-0 h-full w-1 rounded-l-lg bg-gradient-to-b from-sky-500 to-sky-400" />
-              )}
-              <div className="flex items-center justify-between gap-2">
-                <Badge className={statusStyles(item.current_stage ? 'awaiting_approval' : 'locked')} label={item.type === 'quick_run' ? 'quick run' : 'staged'} />
-                {score != null && <span className={`text-xs font-semibold ${isActive ? 'text-sky-800' : 'text-slate-500'}`}>{String(score)}</span>}
-              </div>
-              <p className={`mt-2 line-clamp-3 text-sm font-semibold leading-5 ${isActive ? 'text-sky-900' : 'text-slate-900'}`}>{item.idea}</p>
-              <div className={`mt-3 flex flex-wrap items-center gap-2 text-xs ${isActive ? 'text-sky-700' : 'text-slate-500'}`}>
-                <span>{formatDate(item.updated_at || item.created_at)}</span>
-                {item.current_stage && <span>{stageLabels[item.current_stage] || item.current_stage}</span>}
-              </div>
+              Cancel {activeOperation}
             </button>
-          );
-        })}
-      </div>
-    </aside>
+          )}
+        </div>
+      </CollapsibleCard>
+    </div>
   );
 }
 
@@ -371,14 +713,29 @@ function ProjectStepper({
 }) {
   return (
     <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+      <header className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-sky-700">Workflow map</p>
+          <h2 className="mt-1 text-lg font-bold text-slate-950">Project Stages</h2>
+        </div>
+        <SectionTooltip
+          label="About Project Stages"
+          text="Use this map to see each workflow stage, its status, assigned agent, and the next runnable step."
+        />
+      </header>
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
         {stages.map((stage, index) => {
           const isSelected = selectedStage === stage.name;
           const isNext = nextRunnableName === stage.name && !isSelected;
+          const isApproved = stage.status === 'approved';
           return (
             <button
               className={`rounded-lg border px-3 py-3 text-left transition ${
-                isSelected
+                isApproved && isSelected
+                  ? 'border-emerald-500 bg-emerald-50 ring-2 ring-emerald-100'
+                  : isApproved
+                    ? 'border-emerald-200 bg-emerald-50 hover:border-emerald-300 hover:bg-emerald-100'
+                    : isSelected
                   ? 'border-sky-500 bg-sky-50 ring-2 ring-sky-100'
                   : isNext
                     ? 'border-amber-300 bg-amber-50 hover:border-amber-400'
@@ -406,10 +763,13 @@ function StageWorkspace({
   stage,
   busy,
   expanded,
+  cardExpanded,
   feedback,
   generatedContentRef,
+  isActive,
   setFeedback,
   stageWorkspaceRef,
+  onToggleCard,
   onToggleExpanded,
   onRun,
   onApprove,
@@ -419,10 +779,13 @@ function StageWorkspace({
   stage?: Stage;
   busy: boolean;
   expanded: boolean;
+  cardExpanded: boolean;
   feedback: string;
   generatedContentRef: { current: HTMLDivElement | null };
+  isActive: boolean;
   setFeedback: (value: string) => void;
-  stageWorkspaceRef: { current: HTMLElement | null };
+  stageWorkspaceRef: { current: HTMLDivElement | null };
+  onToggleCard: (expanded: boolean) => void;
   onToggleExpanded: () => void;
   onRun: () => void;
   onApprove: () => void;
@@ -432,26 +795,24 @@ function StageWorkspace({
   if (!stage) return null;
   const output = stageDisplayOutput(stage);
   const stageHasContent = hasStageContent(stage);
-  const canRun = stage.can_run && stage.status !== 'running';
+  const strandedRunning = stage.status === 'running' && !busy;
+  const canRun = stage.can_run && (stage.status !== 'running' || strandedRunning);
   const canApprove = stage.status === 'awaiting_approval' && stageHasContent;
   const canRegenerate = stageHasContent || stage.status === 'failed';
   const canRequestChanges = stageHasContent && feedback.trim().length > 0;
 
   return (
-    <section className="rounded-lg border border-slate-200 bg-white shadow-sm" ref={stageWorkspaceRef}>
-      <header className="flex flex-col gap-3 border-b border-slate-200 px-5 py-4 lg:flex-row lg:items-start lg:justify-between">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-sky-700">Stage Workspace</p>
-          <h2 className="mt-1 text-2xl font-bold text-slate-950">{stageLabels[stage.name] || stage.name}</h2>
-          <p className="mt-1 text-sm text-slate-600">{stage.assigned_agent}</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Badge className={statusStyles(stage.status)} label={stage.status.replaceAll('_', ' ')} />
-          <Badge className="border-slate-200 bg-slate-50 text-slate-700" label={`version ${stage.version}`} />
-        </div>
-      </header>
-
-      <div className="space-y-5 px-5 py-5">
+    <div ref={stageWorkspaceRef}>
+      <StageAccordion
+        defaultExpanded={cardExpanded}
+        isActive={isActive}
+        onToggle={onToggleCard}
+        rightAction={<Badge className="border-slate-200 bg-slate-50 text-slate-700" label={`version ${stage.version}`} />}
+        status={stage.status}
+        subtitle={stage.assigned_agent}
+        title={stageLabels[stage.name] || stage.name}
+        tooltip="Run, approve, regenerate, or request changes for the selected active agent stage. Generated output appears inside this card."
+      >
         <div className="grid gap-3 md:grid-cols-3">
           <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Dependencies</p>
@@ -477,7 +838,7 @@ function StageWorkspace({
             disabled={busy || !canRun}
             onClick={onRun}
           >
-            Run Stage
+            {strandedRunning ? 'Retry Stage' : 'Run Stage'}
           </button>
           <button
             className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-semibold text-emerald-800 transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
@@ -527,29 +888,42 @@ function StageWorkspace({
               </span>
             </button>
             {expanded && (
-              <div className="max-h-[560px] overflow-auto border-t border-slate-200 p-4">
+              <div className="overflow-x-auto border-t border-slate-200 p-4">
                 <FormattedValue value={output} />
               </div>
             )}
           </div>
         ) : (
           <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-5 text-sm text-slate-600">
-            Run this stage to generate the {stageLabels[stage.name] || stage.name} output.
+            {strandedRunning
+              ? 'The previous run did not finish. Retry this stage to continue.'
+              : `Run this stage to generate the ${stageLabels[stage.name] || stage.name} output.`}
           </div>
         )}
-      </div>
-    </section>
+      </StageAccordion>
+    </div>
   );
 }
 
-function AgentDialogueTimeline({ dialogue }: { dialogue: DialogueItem[] }) {
+function AgentDialogueTimeline({
+  dialogue,
+  expanded,
+  onToggle,
+}: {
+  dialogue: DialogueItem[];
+  expanded: boolean;
+  onToggle: (expanded: boolean) => void;
+}) {
   return (
-    <section className="rounded-lg border border-slate-200 bg-white shadow-sm">
-      <header className="border-b border-slate-200 px-5 py-4">
-        <p className="text-xs font-semibold uppercase tracking-wide text-sky-700">Agent Dialogue</p>
-        <h2 className="mt-1 text-xl font-bold text-slate-950">Visible Collaboration</h2>
-      </header>
-      <div className="space-y-3 px-5 py-5">
+    <CollapsibleCard
+      defaultExpanded={expanded}
+      onToggle={onToggle}
+      status={`${dialogue.length} messages`}
+      subtitle="Visible Collaboration"
+      title="Agent Dialogue"
+      tooltip="Shows the visible conversation between agents, including handoffs, critiques, requests, and decisions."
+    >
+      <div className="space-y-3">
         {dialogue.length === 0 && <p className="text-sm text-slate-500">No dialogue yet.</p>}
         {dialogue.map((item) => (
           <article className="rounded-lg border border-slate-200 bg-slate-50 p-4" key={item.id}>
@@ -563,28 +937,37 @@ function AgentDialogueTimeline({ dialogue }: { dialogue: DialogueItem[] }) {
           </article>
         ))}
       </div>
-    </section>
+    </CollapsibleCard>
   );
 }
 
 function ConflictPanel({
   conflicts,
   busy,
+  expanded,
+  onToggle,
   onResolve,
   onAcceptRisk,
 }: {
   conflicts: Conflict[];
   busy: boolean;
+  expanded: boolean;
+  onToggle: (expanded: boolean) => void;
   onResolve: (conflict: Conflict) => void;
   onAcceptRisk: (conflict: Conflict) => void;
 }) {
+  const openConflicts = conflicts.filter((conflict) => conflict.status === 'open').length;
+
   return (
-    <section className="rounded-lg border border-slate-200 bg-white shadow-sm">
-      <header className="border-b border-slate-200 px-5 py-4">
-        <p className="text-xs font-semibold uppercase tracking-wide text-sky-700">Conflict Resolution</p>
-        <h2 className="mt-1 text-xl font-bold text-slate-950">CTO Challenges and Decisions</h2>
-      </header>
-      <div className="space-y-3 px-5 py-5">
+    <CollapsibleCard
+      defaultExpanded={expanded}
+      onToggle={onToggle}
+      status={openConflicts > 0 ? `${openConflicts} open` : 'none open'}
+      subtitle="CTO Challenges and Decisions"
+      title="Conflict Resolution"
+      tooltip="Lists technical conflicts or CTO challenges. Resolve open conflicts or explicitly accept the risk before moving forward."
+    >
+      <div className="space-y-3">
         {conflicts.length === 0 && <p className="text-sm text-slate-500">No conflicts detected yet. CTO review can still challenge the plan later.</p>}
         {conflicts.map((conflict) => (
           <article className="rounded-lg border border-slate-200 bg-slate-50 p-4" key={conflict.id}>
@@ -622,31 +1005,50 @@ function ConflictPanel({
           </article>
         ))}
       </div>
-    </section>
+    </CollapsibleCard>
   );
 }
 
-function BaselinePanel({ comparison, busy, onRun }: { comparison?: Record<string, unknown> | null; busy: boolean; onRun: () => void }) {
+function BaselinePanel({
+  comparison,
+  busy,
+  expanded,
+  onToggle,
+  onRun,
+}: {
+  comparison?: Record<string, unknown> | null;
+  busy: boolean;
+  expanded: boolean;
+  onToggle: (expanded: boolean) => void;
+  onRun: () => void;
+}) {
   const single = comparison?.single_agent as Record<string, unknown> | undefined;
   const multi = comparison?.multi_agent as Record<string, unknown> | undefined;
   const gain = comparison?.efficiency_gain as Record<string, unknown> | undefined;
 
   return (
-    <section className="rounded-lg border border-slate-200 bg-white shadow-sm">
-      <header className="flex flex-col gap-3 border-b border-slate-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-sky-700">Baseline Comparison</p>
-          <h2 className="mt-1 text-xl font-bold text-slate-950">Single Agent vs DevTeam AI</h2>
-        </div>
+    <CollapsibleCard
+      defaultExpanded={expanded}
+      onToggle={onToggle}
+      rightAction={
         <button
           className="rounded-lg bg-slate-950 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
           disabled={busy}
-          onClick={onRun}
+          onClick={(event) => {
+            event.stopPropagation();
+            onRun();
+          }}
+          type="button"
         >
           Run Baseline
         </button>
-      </header>
-      <div className="space-y-4 px-5 py-5">
+      }
+      status={comparison ? 'complete' : 'not run'}
+      subtitle="Single Agent vs DevTeam AI"
+      title="Baseline Comparison"
+      tooltip="Compares the coordinated multi-agent result against a single-agent baseline so you can judge workflow value."
+    >
+      <div className="space-y-4">
         {!comparison && <p className="text-sm text-slate-500">Run the baseline after at least a few planning stages to measure improvement.</p>}
         {comparison && (
           <>
@@ -660,7 +1062,7 @@ function BaselinePanel({ comparison, busy, onRun }: { comparison?: Record<string
           </>
         )}
       </div>
-    </section>
+    </CollapsibleCard>
   );
 }
 
@@ -678,6 +1080,8 @@ function CodePanel({
   selectedFileId,
   setSelectedFileId,
   busy,
+  expanded,
+  onToggle,
   onGenerate,
   onReview,
   exportHref,
@@ -686,6 +1090,8 @@ function CodePanel({
   selectedFileId?: string;
   setSelectedFileId: (id: string) => void;
   busy: boolean;
+  expanded: boolean;
+  onToggle: (expanded: boolean) => void;
   onGenerate: () => void;
   onReview: () => void;
   exportHref: string;
@@ -693,27 +1099,50 @@ function CodePanel({
   const selectedFile = files.find((file) => file.id === selectedFileId) || files[0];
 
   return (
-    <section className="rounded-lg border border-slate-200 bg-white shadow-sm">
-      <header className="flex flex-col gap-3 border-b border-slate-200 px-5 py-4 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-sky-700">Code Generation</p>
-          <h2 className="mt-1 text-xl font-bold text-slate-950">Starter Scaffold</h2>
-        </div>
+    <CollapsibleCard
+      defaultExpanded={expanded}
+      onToggle={onToggle}
+      rightAction={
         <div className="flex flex-wrap gap-2">
-          <button className="rounded-lg bg-slate-950 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400" disabled={busy} onClick={onGenerate}>
+          <button
+            className="rounded-lg bg-slate-950 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+            disabled={busy}
+            onClick={(event) => {
+              event.stopPropagation();
+              onGenerate();
+            }}
+            type="button"
+          >
             Generate Full Project
           </button>
-          <button className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50" disabled={busy || files.length === 0} onClick={onReview}>
+          <button
+            className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={busy || files.length === 0}
+            onClick={(event) => {
+              event.stopPropagation();
+              onReview();
+            }}
+            type="button"
+          >
             Review Code
           </button>
           {files.length > 0 && (
-            <a className="rounded-lg border border-sky-200 bg-sky-50 px-4 py-2 text-sm font-semibold text-sky-800 transition hover:bg-sky-100" href={exportHref}>
+            <a
+              className="rounded-lg border border-sky-200 bg-sky-50 px-4 py-2 text-sm font-semibold text-sky-800 transition hover:bg-sky-100"
+              href={exportHref}
+              onClick={(event) => event.stopPropagation()}
+            >
               Download ZIP
             </a>
           )}
         </div>
-      </header>
-      <div className="grid gap-4 px-5 py-5 lg:grid-cols-[280px_1fr]">
+      }
+      status={files.length > 0 ? `${files.length} files` : 'not generated'}
+      subtitle="Starter Scaffold"
+      title="Code Generation"
+      tooltip="Generate starter project files, review generated code readiness, inspect individual files, and download the ZIP."
+    >
+      <div className="grid gap-4 lg:grid-cols-[280px_1fr]">
         <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
           <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">File Tree</p>
           <div className="mt-3 space-y-1">
@@ -735,43 +1164,55 @@ function CodePanel({
           {selectedFile ? (
             <>
               <div className="border-b border-slate-800 px-4 py-3 text-sm font-semibold text-slate-100">{selectedFile.path}</div>
-              <pre className="max-h-[520px] overflow-auto p-4 text-xs leading-6 text-slate-100">{selectedFile.content}</pre>
+              <pre className="overflow-auto p-4 text-xs leading-6 text-slate-100">{selectedFile.content}</pre>
             </>
           ) : (
             <p className="p-4 text-sm text-slate-300">Generated starter files will appear here after final approval.</p>
           )}
         </div>
       </div>
-    </section>
+    </CollapsibleCard>
   );
 }
 
 export default function Home() {
   const [idea, setIdea] = useState(sampleIdea);
-  const [targetUsers, setTargetUsers] = useState('SME logistics companies, dispatch riders, cashiers, branch managers, finance teams');
-  const [platform, setPlatform] = useState('Android mobile app and web dashboard');
-  const [preferredFrontendStack, setPreferredFrontendStack] = useState('Auto-select best stack');
-  const [constraints, setConstraints] = useState('Must work offline\nMust support low-end Android devices\nMust generate audit logs');
-  const [includeBaseline, setIncludeBaseline] = useState(true);
+  const [targetUsers, setTargetUsers] = useState('Freelancers, solo founders, and students managing daily tasks');
+  const [platform, setPlatform] = useState('Single-page responsive web app');
+  const [preferredFrontendStack, setPreferredFrontendStack] = useState('Next.js + TypeScript');
+  const [constraints, setConstraints] = useState('Single page only\nNo authentication for MVP\nPersist tasks in local browser storage');
+  const [includeBaseline, setIncludeBaseline] = useState(false);
   const [project, setProject] = useState<StagedProject | null>(null);
   const [history, setHistory] = useState<ProjectHistoryItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [historyExpanded, setHistoryExpanded] = useState(false);
+  const [historyVisibleCount, setHistoryVisibleCount] = useState(HISTORY_BATCH_SIZE);
+  const [setupExpanded, setSetupExpanded] = useState(true);
   const [activeStageName, setActiveStageName] = useState('decomposition');
   const [expandedStageName, setExpandedStageName] = useState<string | null>('decomposition');
+  const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>({});
   const [, setManuallySelectedStage] = useState(false);
   const [selectedFileId, setSelectedFileId] = useState<string | undefined>();
   const [feedback, setFeedback] = useState('');
   const [events, setEvents] = useState<UiEvent[]>([]);
   const [busy, setBusy] = useState(false);
+  const [activeOperation, setActiveOperation] = useState('');
   const [error, setError] = useState('');
-  const stageWorkspaceRef = useRef<HTMLElement | null>(null);
+  const activeAbortControllerRef = useRef<AbortController | null>(null);
+  const cancelRequestedRef = useRef(false);
+  const stageWorkspaceRef = useRef<HTMLDivElement | null>(null);
   const generatedContentRef = useRef<HTMLDivElement | null>(null);
   const codePanelRef = useRef<HTMLDivElement | null>(null);
   const finalReportRef = useRef<HTMLElement | null>(null);
+  const isFullScreenLayout = useMediaQuery('(min-width: 1280px)');
 
   useEffect(() => {
-    void loadHistory();
-  }, []);
+    if ((isFullScreenLayout || historyExpanded) && !historyLoaded && !historyLoading) {
+      void loadHistory();
+    }
+  }, [isFullScreenLayout, historyExpanded, historyLoaded, historyLoading]);
 
   const selectedStage = useMemo(
     () => project?.stages.find((stage) => stage.name === activeStageName) || project?.stages[0],
@@ -781,6 +1222,29 @@ export default function Home() {
     () => (project ? getNextRunnableStage(project.stages, activeStageName) : null),
     [project, activeStageName],
   );
+  const activeCardId = `stage:${selectedStage?.name || activeStageName}`;
+  const stageCardExpanded = isCardExpanded(activeCardId, activeCardId, expandedCards);
+  const dialogueExpanded = expandedCards.dialogue ?? false;
+  const conflictsExpanded = expandedCards.conflicts ?? false;
+  const baselineExpanded = expandedCards.baseline ?? false;
+  const codeExpanded = expandedCards.code ?? false;
+  const visibleHistory = useMemo(
+    () => history.slice(0, historyVisibleCount),
+    [history, historyVisibleCount],
+  );
+  const hasMoreHistory = historyVisibleCount < history.length;
+
+  useEffect(() => {
+    if (!project) return;
+    setExpandedCards((prev) => {
+      const next = { ...prev, [activeCardId]: true };
+      for (const stage of project.stages) {
+        const cardId = `stage:${stage.name}`;
+        if (cardId !== activeCardId) next[cardId] = false;
+      }
+      return next;
+    });
+  }, [activeCardId, project]);
 
   function scrollToElement(element: HTMLElement | null) {
     window.setTimeout(() => {
@@ -791,16 +1255,31 @@ export default function Home() {
   function selectStage(stageName: string, manual = false) {
     setActiveStageName(stageName);
     setExpandedStageName(stageName);
+    setExpandedCards((prev) => ({ ...prev, [`stage:${stageName}`]: true }));
     setManuallySelectedStage(manual);
+  }
+
+  function toggleCard(cardId: string, currentExpanded = isCardExpanded(cardId, activeCardId, expandedCards)) {
+    setExpandedCards((prev) => ({
+      ...prev,
+      [cardId]: !currentExpanded,
+    }));
   }
 
   function addEvent(type: string, agent: string, message: string, stage?: string) {
     setEvents((prev) => [...prev, { type, agent, message, stage, timestamp: new Date().toISOString() }]);
   }
 
-  async function request<T>(path: string, options: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  function cancelRunningProcess() {
+    if (!activeAbortControllerRef.current || !activeOperation) return;
+    cancelRequestedRef.current = true;
+    activeAbortControllerRef.current.abort();
+    setError('');
+    addEvent('workflow_cancelled', 'User', `${activeOperation} cancelled.`);
+  }
+
+  async function request<T>(path: string, options: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS, abortSignal?: AbortSignal) {
+    const controller = linkedAbortSignal(timeoutMs, abortSignal);
     try {
       const response = await fetch(`${API_BASE_URL}${path}`, {
         ...options,
@@ -811,61 +1290,106 @@ export default function Home() {
         },
       });
       if (!response.ok) {
-        throw new Error(await response.text());
+        throw new Error(await responseErrorMessage(response, path));
       }
       return (await response.json()) as T;
     } catch (err) {
-      throw new Error(errorMessage(err, 'Request timed out. Please retry.'));
+      const fallback = abortSignal?.aborted && cancelRequestedRef.current ? 'Request cancelled.' : 'Request timed out. Please retry.';
+      throw new Error(errorMessage(err, fallback));
     } finally {
-      window.clearTimeout(timeoutId);
+      controller.cleanup();
     }
   }
 
   async function loadHistory() {
+    if (historyLoading) return;
     setHistoryLoading(true);
+    setHistoryError('');
     try {
       const projects = await request<ProjectHistoryItem[]>('/projects');
       setHistory(projects);
+      setHistoryVisibleCount(HISTORY_BATCH_SIZE);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not load project history');
+      setHistoryError(err instanceof Error ? err.message : 'Could not load project history');
     } finally {
+      setHistoryLoaded(true);
       setHistoryLoading(false);
     }
   }
 
-  async function guarded(action: () => Promise<void>) {
+  function loadMoreHistory() {
+    setHistoryVisibleCount((count) => Math.min(count + HISTORY_BATCH_SIZE, history.length));
+  }
+
+  function toggleHistory(nextExpanded: boolean) {
+    setHistoryExpanded(nextExpanded);
+    if (nextExpanded && !historyLoaded && !historyLoading) {
+      void loadHistory();
+    }
+  }
+
+  async function refreshHistoryIfVisible() {
+    if (historyLoaded || historyExpanded || isFullScreenLayout) {
+      await loadHistory();
+    }
+  }
+
+  async function guarded(action: (abortSignal?: AbortSignal) => Promise<void>, operationLabel = 'Running process') {
+    const controller = new AbortController();
+    activeAbortControllerRef.current = controller;
+    cancelRequestedRef.current = false;
+    setActiveOperation(operationLabel);
     setBusy(true);
     setError('');
     try {
-      await action();
+      await action(controller.signal);
     } catch (err) {
+      if (controller.signal.aborted && cancelRequestedRef.current) {
+        setError('');
+        return;
+      }
       const message = err instanceof Error ? err.message : 'Something went wrong';
       setError(message);
       addEvent('workflow_failed', 'System', message);
     } finally {
+      if (activeAbortControllerRef.current === controller) {
+        activeAbortControllerRef.current = null;
+      }
+      cancelRequestedRef.current = false;
+      setActiveOperation('');
       setBusy(false);
     }
   }
 
   async function openProject(projectId: string) {
-    await guarded(async () => {
-      const loaded = await request<StagedProject>(`/projects/${projectId}`);
+    await guarded(async (abortSignal) => {
+      const loaded = await request<StagedProject>(`/projects/${projectId}`, {}, REQUEST_TIMEOUT_MS, abortSignal);
       if (!Array.isArray(loaded.stages)) {
         throw new Error('This saved item is from the older quick-run flow and cannot be reopened in the staged workspace.');
       }
       const defaultStage = getDefaultExpandedStage(loaded.stages);
+      const activeStage = defaultStage?.name || loaded.current_stage || 'decomposition';
+      setIdea(loaded.idea);
+      setTargetUsers(loaded.target_users || '');
+      setPlatform(loaded.platform || '');
+      setPreferredFrontendStack(loaded.preferred_frontend_stack || 'Auto-select best stack');
+      setConstraints(loaded.constraints.join('\n'));
+      setIncludeBaseline(loaded.include_baseline);
       setProject(loaded);
-      selectStage(defaultStage?.name || loaded.current_stage || 'decomposition');
+      setActiveStageName(activeStage);
+      setExpandedStageName(activeStage);
+      setExpandedCards(expandedCardsForLoadedProject(loaded, activeStage));
+      setManuallySelectedStage(false);
       setFeedback('');
       setEvents([]);
       setSelectedFileId(loaded.generated_files[0]?.id);
-      addEvent('project_loaded', 'System', 'Loaded saved conversation.', defaultStage?.name || loaded.current_stage);
+      addEvent('project_loaded', 'System', 'Loaded saved conversation.', activeStage);
       scrollToElement(stageWorkspaceRef.current);
-    });
+    }, 'Opening project');
   }
 
   async function createProject() {
-    await guarded(async () => {
+    await guarded(async (abortSignal) => {
       const created = await request<StagedProject>('/projects', {
         method: 'POST',
         body: JSON.stringify({
@@ -876,20 +1400,21 @@ export default function Home() {
           preferred_frontend_stack: preferredFrontendStack,
           include_baseline: includeBaseline,
         }),
-      });
+      }, REQUEST_TIMEOUT_MS, abortSignal);
       setProject(created);
+      setSetupExpanded(false);
       selectStage('decomposition');
       setEvents([]);
       addEvent('workflow_started', 'Orchestrator Agent', 'Project created. Decomposition is ready to run.', 'decomposition');
-      await loadHistory();
+      await refreshHistoryIfVisible();
       scrollToElement(stageWorkspaceRef.current);
-    });
+    }, 'Creating project');
   }
 
   async function runStage(stageName: string, stageFeedback?: string) {
     if (!project) return;
     const stage = project.stages.find((item) => item.name === stageName);
-    await guarded(async () => {
+    await guarded(async (abortSignal) => {
       selectStage(stageName);
       setProject((current) =>
         current
@@ -901,17 +1426,16 @@ export default function Home() {
       );
       scrollToElement(stageWorkspaceRef.current);
       addEvent('stage_started', stage?.assigned_agent || 'Agent', `Running ${stageLabels[stageName] || stageName}.`, stageName);
-      const controller = new AbortController();
-      const timeoutId = window.setTimeout(() => controller.abort(), STAGE_RUN_TIMEOUT_MS);
+      const controller = linkedAbortSignal(STAGE_RUN_TIMEOUT_MS, abortSignal);
       try {
-        const response = await fetch(`${API_BASE_URL}/projects/${project.id}/stages/${stageName}/run-stream`, {
+        const response = await fetch(`${STREAM_API_BASE_URL}/projects/${project.id}/stages/${stageName}/run-stream`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ feedback: stageFeedback || null }),
           signal: controller.signal,
         });
         if (!response.ok || !response.body) {
-          throw new Error(await response.text());
+          throw new Error(await responseErrorMessage(response, `/projects/${project.id}/stages/${stageName}/run-stream`));
         }
 
         const reader = response.body.getReader();
@@ -981,38 +1505,51 @@ export default function Home() {
         }
         setFeedback('');
         addEvent('stage_awaiting_approval', stage?.assigned_agent || 'Agent', `${stageLabels[stageName] || stageName} is awaiting approval.`, stageName);
-        await loadHistory();
+        await refreshHistoryIfVisible();
         scrollToElement(generatedContentRef.current);
       } catch (err) {
+        if (abortSignal?.aborted && cancelRequestedRef.current) {
+          if (stage) {
+            setProject((current) =>
+              current
+                ? updateStageInProject(current, stageName, {
+                    ...stageStateAfterCancel(stage),
+                  })
+                : current,
+            );
+          }
+          return;
+        }
         const message = errorMessage(err, `${stageLabels[stageName] || stageName} timed out. Click Retry Stage to run it again.`);
         setProject((current) => (current ? updateStageInProject(current, stageName, { status: 'failed', can_run: true }) : current));
         addEvent('workflow_failed', stage?.assigned_agent || 'Agent', message, stageName);
-        await loadHistory();
+        await refreshHistoryIfVisible();
         throw new Error(message);
       } finally {
-        window.clearTimeout(timeoutId);
+        controller.cleanup();
       }
-    });
+    }, `Running ${stageLabels[stageName] || stageName}`);
   }
 
   async function approveStage(stageName: string) {
     if (!project) return;
-    await guarded(async () => {
-      const updated = await request<StagedProject>(`/projects/${project.id}/stages/${stageName}/approve`, { method: 'POST' });
+    await guarded(async (abortSignal) => {
+      const updated = await request<StagedProject>(`/projects/${project.id}/stages/${stageName}/approve`, { method: 'POST' }, REQUEST_TIMEOUT_MS, abortSignal);
       setProject(updated);
       const nextStage = getNextRunnableStage(updated.stages, stageName);
       if (nextStage) {
         selectStage(nextStage.name);
       }
       addEvent('stage_completed', 'User', `Approved ${stageLabels[stageName] || stageName}.`, stageName);
-      await loadHistory();
+      await refreshHistoryIfVisible();
       scrollToElement(stageWorkspaceRef.current);
-    });
+    }, `Approving ${stageLabels[stageName] || stageName}`);
   }
 
   async function reviseStage(stageName: string) {
     if (!project) return;
-    await guarded(async () => {
+    const stage = project.stages.find((item) => item.name === stageName);
+    await guarded(async (abortSignal) => {
       selectStage(stageName);
       setProject((current) => (current ? updateStageInProject(current, stageName, { status: 'running', can_run: true }) : current));
       addEvent('agent_message', 'User', feedback, stageName);
@@ -1024,89 +1561,128 @@ export default function Home() {
             body: JSON.stringify({ feedback }),
           },
           STAGE_RUN_TIMEOUT_MS,
+          abortSignal,
         );
         setProject(updated);
         selectStage(stageName);
         setFeedback('');
         addEvent('stage_awaiting_approval', updated.stages.find((stage) => stage.name === stageName)?.assigned_agent || 'Agent', 'Revision is awaiting approval.', stageName);
-        await loadHistory();
+        await refreshHistoryIfVisible();
         scrollToElement(generatedContentRef.current);
       } catch (err) {
+        if (abortSignal?.aborted && cancelRequestedRef.current) {
+          if (stage) {
+            setProject((current) =>
+              current
+                ? updateStageInProject(current, stageName, {
+                    ...stageStateAfterCancel(stage),
+                  })
+                : current,
+            );
+          }
+          return;
+        }
         const message = errorMessage(err, `${stageLabels[stageName] || stageName} revision timed out. Click Retry Stage to run it again.`);
         setProject((current) => (current ? updateStageInProject(current, stageName, { status: 'failed', can_run: true }) : current));
         addEvent('workflow_failed', stageName, message, stageName);
-        await loadHistory();
+        await refreshHistoryIfVisible();
         throw new Error(message);
       }
-    });
+    }, `Revising ${stageLabels[stageName] || stageName}`);
   }
 
   async function resolveConflict(conflict: Conflict, action: 'resolve' | 'accept_risk') {
     if (!project) return;
-    await guarded(async () => {
+    await guarded(async (abortSignal) => {
       addEvent(action === 'resolve' ? 'negotiation_started' : 'agent_message', 'Negotiator Agent', conflict.description, 'negotiation');
       const updated = await request<StagedProject>(`/projects/${project.id}/conflicts/${conflict.id}/resolve`, {
         method: 'POST',
         body: JSON.stringify({ action }),
-      });
+      }, STAGE_RUN_TIMEOUT_MS, abortSignal);
       setProject(updated);
       addEvent('negotiation_completed', 'Negotiator Agent', action === 'resolve' ? 'Conflict resolved.' : 'Risk accepted.', 'negotiation');
-      await loadHistory();
-    });
+      await refreshHistoryIfVisible();
+    }, action === 'resolve' ? 'Resolving conflict' : 'Accepting risk');
   }
 
   async function runBaseline() {
     if (!project) return;
-    await guarded(async () => {
+    await guarded(async (abortSignal) => {
       addEvent('baseline_started', 'Single Agent Baseline', 'Running single-agent baseline comparison.');
-      const updated = await request<StagedProject>(`/projects/${project.id}/baseline/run`, { method: 'POST' }, STAGE_RUN_TIMEOUT_MS);
+      const updated = await request<StagedProject>(`/projects/${project.id}/baseline/run`, { method: 'POST' }, STAGE_RUN_TIMEOUT_MS, abortSignal);
       setProject(updated);
       addEvent('comparison_completed', 'System', 'Baseline comparison completed.');
-      await loadHistory();
-    });
+      await refreshHistoryIfVisible();
+    }, 'Running baseline');
   }
 
   async function generateCode() {
     if (!project) return;
-    await guarded(async () => {
+    const stage = project.stages.find((item) => item.name === 'code_generation');
+    await guarded(async (abortSignal) => {
       selectStage('code_generation');
       setProject((current) => (current ? updateStageInProject(current, 'code_generation', { status: 'running', can_run: true }) : current));
       addEvent('code_generation_started', 'Code Generator Agent', 'Generating starter scaffold.', 'code_generation');
       try {
-        const updated = await request<StagedProject>(`/projects/${project.id}/generate-code`, { method: 'POST' }, STAGE_RUN_TIMEOUT_MS);
+        const updated = await request<StagedProject>(`/projects/${project.id}/generate-code`, { method: 'POST' }, STAGE_RUN_TIMEOUT_MS, abortSignal);
         setProject(updated);
         setSelectedFileId(updated.generated_files[0]?.id);
         addEvent('code_generation_completed', 'Code Generator Agent', 'Starter scaffold generated.', 'code_generation');
-        await loadHistory();
+        await refreshHistoryIfVisible();
         scrollToElement(codePanelRef.current);
       } catch (err) {
+        if (abortSignal?.aborted && cancelRequestedRef.current) {
+          if (stage) {
+            setProject((current) =>
+              current
+                ? updateStageInProject(current, 'code_generation', {
+                    ...stageStateAfterCancel(stage),
+                  })
+                : current,
+            );
+          }
+          return;
+        }
         const message = errorMessage(err, 'Code generation timed out. Click Retry Stage to run it again.');
         setProject((current) => (current ? updateStageInProject(current, 'code_generation', { status: 'failed', can_run: true }) : current));
         addEvent('workflow_failed', 'Code Generator Agent', message, 'code_generation');
-        await loadHistory();
+        await refreshHistoryIfVisible();
         throw new Error(message);
       }
-    });
+    }, 'Generating code');
   }
 
   async function reviewCode() {
     if (!project) return;
-    await guarded(async () => {
+    const stage = project.stages.find((item) => item.name === 'code_review');
+    await guarded(async (abortSignal) => {
       selectStage('code_review');
       setProject((current) => (current ? updateStageInProject(current, 'code_review', { status: 'running', can_run: true }) : current));
       try {
-        const updated = await request<StagedProject>(`/projects/${project.id}/review-code`, { method: 'POST' }, STAGE_RUN_TIMEOUT_MS);
+        const updated = await request<StagedProject>(`/projects/${project.id}/review-code`, { method: 'POST' }, STAGE_RUN_TIMEOUT_MS, abortSignal);
         setProject(updated);
         addEvent('stage_completed', 'Code Reviewer Agent', 'Code review completed.', 'code_review');
-        await loadHistory();
+        await refreshHistoryIfVisible();
       } catch (err) {
+        if (abortSignal?.aborted && cancelRequestedRef.current) {
+          if (stage) {
+            setProject((current) =>
+              current
+                ? updateStageInProject(current, 'code_review', {
+                    ...stageStateAfterCancel(stage),
+                  })
+                : current,
+            );
+          }
+          return;
+        }
         const message = errorMessage(err, 'Code review timed out. Click Retry Stage to run it again.');
         setProject((current) => (current ? updateStageInProject(current, 'code_review', { status: 'failed', can_run: true }) : current));
         addEvent('workflow_failed', 'Code Reviewer Agent', message, 'code_review');
-        await loadHistory();
+        await refreshHistoryIfVisible();
         throw new Error(message);
       }
-    });
+    }, 'Reviewing code');
   }
 
   const reportResult = project
@@ -1120,69 +1696,98 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-slate-50 text-slate-950">
       <div className="mx-auto w-full max-w-[1600px] px-4 py-8 sm:px-6 lg:px-8">
-        <header className="mb-6">
-          <div className="inline-flex rounded-full border border-sky-200 bg-sky-50 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-sky-700">
+        <header className="mx-auto mb-8 max-w-5xl text-center">
+          <div className="inline-flex items-center gap-2 rounded-full border border-sky-200 bg-white px-4 py-1.5 text-xs font-bold uppercase tracking-wide text-sky-700 shadow-sm">
+            <span className="h-2 w-2 rounded-full bg-emerald-500" />
             Qwen Cloud - Agent Society
           </div>
-          <h1 className="mt-4 text-4xl font-bold tracking-tight text-slate-950 sm:text-5xl">DevTeam AI</h1>
-          <p className="mt-3 max-w-4xl text-base leading-7 text-slate-600">
-            A staged multi-agent software delivery team with decomposition, role assignment, visible dialogue,
-            CTO challenges, negotiation, approval gates, baseline scoring, and optional starter-code generation.
+          <h1 className="mx-auto mt-5 max-w-4xl text-4xl font-black tracking-tight text-slate-950 sm:text-6xl">
+            DevTeam AI turns a rough product idea into a coordinated delivery plan.
+          </h1>
+          <p className="mx-auto mt-4 max-w-3xl text-base leading-7 text-slate-600 sm:text-lg">
+            Watch specialist agents decompose the brief, challenge assumptions, negotiate decisions, approve stages,
+            compare against a baseline, and produce starter code.
           </p>
+          <div className="mx-auto mt-6 grid max-w-4xl gap-2 sm:grid-cols-4">
+            {[
+              ['01', 'Decompose'],
+              ['02', 'Challenge'],
+              ['03', 'Approve'],
+              ['04', 'Generate'],
+            ].map(([step, label], index) => {
+              const isFirst = index === 0;
+              const isLast = index === 3;
+              const clipPath = isFirst
+                ? 'polygon(0 0, calc(100% - 18px) 0, 100% 50%, calc(100% - 18px) 100%, 0 100%)'
+                : isLast
+                  ? 'polygon(0 0, 100% 0, 100% 100%, 0 100%, 18px 50%)'
+                  : 'polygon(0 0, calc(100% - 18px) 0, 100% 50%, calc(100% - 18px) 100%, 0 100%, 18px 50%)';
+
+              return (
+                <div
+                  className="bg-slate-200 p-px shadow-sm"
+                  key={step}
+                  style={{ clipPath }}
+                >
+                  <div
+                    className={`h-full bg-white px-4 py-3 text-left ${
+                      isFirst ? 'pr-7' : isLast ? 'pl-7' : 'px-7'
+                    }`}
+                    style={{ clipPath }}
+                  >
+                    <span className="text-xs font-bold uppercase tracking-wide text-sky-700">{step}</span>
+                    <p className="mt-1 text-sm font-bold text-slate-950">{label}</p>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </header>
 
-        <section className="grid gap-6 lg:grid-cols-[280px_390px_1fr]">
-          <HistorySidebar
-            activeProjectId={project?.id}
-            busy={busy}
-            history={history}
-            loading={historyLoading}
-            onOpen={openProject}
-            onRefresh={() => {
-              void loadHistory();
-            }}
-          />
-
-          <aside className="h-fit rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
-            <div className="space-y-4">
-              <label className="block">
-                <span className="text-sm font-semibold text-slate-800">Product idea</span>
-                <textarea className="mt-2 min-h-40 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm leading-6 text-slate-900 shadow-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100" value={idea} onChange={(event) => setIdea(event.target.value)} />
-              </label>
-              <label className="block">
-                <span className="text-sm font-semibold text-slate-800">Target users</span>
-                <input className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100" value={targetUsers} onChange={(event) => setTargetUsers(event.target.value)} />
-              </label>
-              <label className="block">
-                <span className="text-sm font-semibold text-slate-800">Platform</span>
-                <input className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100" value={platform} onChange={(event) => setPlatform(event.target.value)} />
-              </label>
-              <label className="block">
-                <span className="text-sm font-semibold text-slate-800">Preferred frontend/mobile stack</span>
-                <select className="mt-2 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100" value={preferredFrontendStack} onChange={(event) => setPreferredFrontendStack(event.target.value)}>
-                  {frontendStackOptions.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="block">
-                <span className="text-sm font-semibold text-slate-800">Constraints, one per line</span>
-                <textarea className="mt-2 min-h-32 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm leading-6 text-slate-900 shadow-sm outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100" value={constraints} onChange={(event) => setConstraints(event.target.value)} />
-              </label>
-              <label className="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-800">
-                <input className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500" type="checkbox" checked={includeBaseline} onChange={(event) => setIncludeBaseline(event.target.checked)} />
-                Include single-agent baseline
-              </label>
-              <button className="inline-flex w-full items-center justify-center rounded-lg bg-slate-950 px-4 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400" disabled={busy || idea.trim().length < 10} onClick={createProject}>
-                {project ? 'Create New Project' : 'Create Staged Project'}
-              </button>
-              <ErrorState message={error} />
-            </div>
+        <section className="grid gap-6 xl:grid-cols-[minmax(320px,420px)_minmax(0,1fr)]">
+          <aside className="min-w-0 space-y-4 xl:sticky xl:top-6 xl:self-start">
+            <ProjectSetupPanel
+              activeOperation={activeOperation}
+              busy={busy}
+              constraints={constraints}
+              error={error}
+              expanded={setupExpanded}
+              idea={idea}
+              includeBaseline={includeBaseline}
+              platform={platform}
+              preferredFrontendStack={preferredFrontendStack}
+              projectActive={Boolean(project)}
+              setConstraints={setConstraints}
+              setIdea={setIdea}
+              setIncludeBaseline={setIncludeBaseline}
+              setPlatform={setPlatform}
+              setPreferredFrontendStack={setPreferredFrontendStack}
+              setTargetUsers={setTargetUsers}
+              targetUsers={targetUsers}
+              onCancel={cancelRunningProcess}
+              onCreateProject={createProject}
+              onToggle={setSetupExpanded}
+            />
+            <HistorySidebar
+              activeProjectId={project?.id}
+              busy={busy}
+              expanded={historyExpanded}
+              error={historyError}
+              hasLoaded={historyLoaded}
+              hasMore={hasMoreHistory}
+              history={visibleHistory}
+              loading={historyLoading}
+              onLoadMore={loadMoreHistory}
+              onOpen={openProject}
+              onRefresh={() => {
+                void loadHistory();
+              }}
+              onToggle={toggleHistory}
+              totalCount={history.length}
+            />
           </aside>
 
-          <div className="space-y-6">
+          <div className="min-w-0 space-y-6">
             {project ? (
               <>
                 <ProjectStepper
@@ -1191,66 +1796,95 @@ export default function Home() {
                   selectedStage={selectedStage?.name || activeStageName}
                   stages={project.stages}
                 />
-                <StageWorkspace
-                  busy={busy}
-                  expanded={expandedStageName === selectedStage?.name}
-                  feedback={feedback}
-                  generatedContentRef={generatedContentRef}
-                  onApprove={() => selectedStage && approveStage(selectedStage.name)}
-                  onRegenerate={() => selectedStage && runStage(selectedStage.name)}
-                  onRevise={() => selectedStage && reviseStage(selectedStage.name)}
-                  onRun={() => selectedStage && runStage(selectedStage.name)}
-                  onToggleExpanded={() => {
-                    if (!selectedStage) return;
-                    setExpandedStageName(expandedStageName === selectedStage.name ? null : selectedStage.name);
-                  }}
-                  setFeedback={setFeedback}
-                  stage={selectedStage}
-                  stageWorkspaceRef={stageWorkspaceRef}
-                />
-                <AgentDialogueTimeline dialogue={project.dialogue} />
-                <ConflictPanel
-                  busy={busy}
-                  conflicts={project.conflicts}
-                  onAcceptRisk={(conflict) => resolveConflict(conflict, 'accept_risk')}
-                  onResolve={(conflict) => resolveConflict(conflict, 'resolve')}
-                />
-                <BaselinePanel busy={busy} comparison={project.baseline_comparison} onRun={runBaseline} />
-                <div ref={codePanelRef}>
-                  <CodePanel
-                    busy={busy}
-                    exportHref={`${API_BASE_URL}/projects/${project.id}/export`}
-                    files={project.generated_files}
-                    onGenerate={generateCode}
-                    onReview={reviewCode}
-                    selectedFileId={selectedFileId}
-                    setSelectedFileId={setSelectedFileId}
-                  />
-                </div>
-                <section aria-label="Final report" ref={finalReportRef}>
-                  {reportResult && (
-                    <ReportLayout
-                      apiBaseUrl={API_BASE_URL}
-                      expandedStageName={expandedStageName || getDefaultExpandedStage(project.stages)?.name || undefined}
-                      requestContext={{ platform, preferredFrontendStack, targetUsers }}
-                      result={reportResult}
+                <div className="grid min-w-0 gap-6 2xl:grid-cols-[minmax(0,560px)_minmax(0,1fr)]">
+                  <div className="min-w-0 space-y-6">
+                    <StageWorkspace
+                      busy={busy}
+                      cardExpanded={stageCardExpanded}
+                      expanded={expandedStageName === selectedStage?.name}
+                      feedback={feedback}
+                      generatedContentRef={generatedContentRef}
+                      isActive={selectedStage?.name === activeStageName}
+                      onApprove={() => selectedStage && approveStage(selectedStage.name)}
+                      onRegenerate={() => selectedStage && runStage(selectedStage.name)}
+                      onRevise={() => selectedStage && reviseStage(selectedStage.name)}
+                      onRun={() => selectedStage && runStage(selectedStage.name)}
+                      onToggleCard={() => toggleCard(activeCardId, stageCardExpanded)}
+                      onToggleExpanded={() => {
+                        if (!selectedStage) return;
+                        setExpandedStageName(expandedStageName === selectedStage.name ? null : selectedStage.name);
+                      }}
+                      setFeedback={setFeedback}
+                      stage={selectedStage}
+                      stageWorkspaceRef={stageWorkspaceRef}
                     />
-                  )}
-                </section>
+                    <AgentDialogueTimeline
+                      dialogue={project.dialogue}
+                      expanded={dialogueExpanded}
+                      onToggle={() => toggleCard('dialogue', dialogueExpanded)}
+                    />
+                    <ActivityTimeline events={events} />
+                  </div>
+                  <div className="min-w-0 space-y-6">
+                    <ConflictPanel
+                      busy={busy}
+                      conflicts={project.conflicts}
+                      expanded={conflictsExpanded}
+                      onToggle={() => toggleCard('conflicts', conflictsExpanded)}
+                      onAcceptRisk={(conflict) => resolveConflict(conflict, 'accept_risk')}
+                      onResolve={(conflict) => resolveConflict(conflict, 'resolve')}
+                    />
+                    <BaselinePanel
+                      busy={busy}
+                      comparison={project.baseline_comparison}
+                      expanded={baselineExpanded}
+                      onRun={runBaseline}
+                      onToggle={() => toggleCard('baseline', baselineExpanded)}
+                    />
+                    <div ref={codePanelRef}>
+                      <CodePanel
+                        busy={busy}
+                        expanded={codeExpanded}
+                        exportHref={`${API_BASE_URL}/projects/${project.id}/export`}
+                        files={project.generated_files}
+                        onGenerate={generateCode}
+                        onReview={reviewCode}
+                        onToggle={() => toggleCard('code', codeExpanded)}
+                        selectedFileId={selectedFileId}
+                        setSelectedFileId={setSelectedFileId}
+                      />
+                    </div>
+                    <section aria-label="Final report" className="min-w-0" ref={finalReportRef}>
+                      {reportResult && (
+                        <ReportLayout
+                          apiBaseUrl={API_BASE_URL}
+                          expandedStageName={expandedStageName || getDefaultExpandedStage(project.stages)?.name || undefined}
+                          requestContext={{ platform, preferredFrontendStack, targetUsers }}
+                          result={reportResult}
+                        />
+                      )}
+                    </section>
+                  </div>
+                </div>
               </>
             ) : (
-              <>
+              <div className="grid min-w-0 gap-6 2xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
                 <ActivityTimeline events={events} />
                 <article className="rounded-lg border border-dashed border-slate-300 bg-white px-5 py-8 text-center shadow-sm">
-                  <h2 className="text-xl font-bold text-slate-950">Agent Society Workspace</h2>
+                  <div className="flex items-start justify-center gap-3">
+                    <h2 className="text-xl font-bold text-slate-950">Agent Society Workspace</h2>
+                    <SectionTooltip
+                      label="About Agent Society Workspace"
+                      text="This area fills with stage outputs, agent dialogue, conflict resolution, generated files, and the final report after you create a project."
+                    />
+                  </div>
                   <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-600">
                     Create a staged project to unlock decomposition, approvals, dialogue, conflicts, baseline comparison,
                     and code generation.
                   </p>
                 </article>
-              </>
+              </div>
             )}
-            {project && <ActivityTimeline events={events} />}
           </div>
         </section>
       </div>

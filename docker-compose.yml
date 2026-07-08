@@ -1,18 +1,21 @@
 services:
   backend:
     build: ./backend
-    ports:
-      - "8000:8000"
+    restart: unless-stopped
     env_file:
       - ./backend/.env
     volumes:
       - ./backend/data:/app/data
+    expose:
+      - "8000"
 
   frontend:
     build: ./frontend
-    ports:
-      - "3000:3000"
+    restart: unless-stopped
     environment:
-      - NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_BASE_URL=/api/backend
+      - BACKEND_INTERNAL_URL=http://backend:8000
+    ports:
+      - "80:3000"
     depends_on:
       - backend

@@ -24,7 +24,15 @@ function objectArrayKeys(items: unknown[]) {
 
 function shouldRenderTable(items: unknown[]) {
   const keys = objectArrayKeys(items);
-  return keys.length > 0 && keys.length <= 6 && items.length <= 20;
+  const hasLargeNestedValue = items.some((item) => {
+    if (!isPlainObject(item)) return false;
+    return Object.values(item).some((value) => {
+      if (typeof value === 'string') return value.length > 240;
+      if (Array.isArray(value)) return value.length > 4 || value.some((entry) => isPlainObject(entry) || Array.isArray(entry));
+      return isPlainObject(value);
+    });
+  });
+  return keys.length > 0 && keys.length <= 6 && items.length <= 12 && !hasLargeNestedValue;
 }
 
 function DataTable({ rows }: { rows: unknown[] }) {
@@ -49,7 +57,7 @@ function DataTable({ rows }: { rows: unknown[] }) {
             return (
               <tr key={index}>
                 {keys.map((key) => (
-                  <td className="max-w-xs px-3 py-3 align-top text-slate-700" key={key}>
+                  <td className="min-w-48 max-w-2xl whitespace-normal break-words px-3 py-3 align-top text-slate-700" key={key}>
                     <RenderUnknownValue compact value={objectRow[key]} />
                   </td>
                 ))}
@@ -64,7 +72,7 @@ function DataTable({ rows }: { rows: unknown[] }) {
 
 function CodeBlock({ code, language }: { code: string; language?: string }) {
   return (
-    <pre className="overflow-x-auto rounded-lg border border-slate-800 bg-slate-950 p-4 text-xs leading-6 text-slate-100">
+    <pre className="overflow-auto whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-950 p-4 text-xs leading-6 text-slate-100">
       <code>{language ? `${language}\n${code}` : code}</code>
     </pre>
   );
