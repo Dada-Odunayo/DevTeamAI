@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     qwen_model: str = Field(default="qwen-plus", alias="QWEN_MODEL")
     app_env: str = Field(default="local", alias="APP_ENV")
     database_path: str = Field(default="data/devteam.sqlite", alias="DATABASE_PATH")
-    qwen_timeout_seconds: int = Field(default=90, alias="QWEN_TIMEOUT_SECONDS")
+    qwen_timeout_seconds: int = Field(default=180, alias="QWEN_TIMEOUT_SECONDS")
 
     model_config = SettingsConfigDict(env_file=".env", populate_by_name=True, extra="ignore")
 

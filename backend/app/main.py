@@ -201,7 +201,12 @@ async def run_project(request: ProjectRunRequest) -> dict:
 
 @app.post("/projects", response_model=StagedProjectResponse)
 def create_project(request: ProjectCreateRequest) -> dict:
-    return staged_projects.create_project(request)
+    try:
+        return staged_projects.create_project(request)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not create project: {exc}") from exc
 
 
 @app.get("/projects/{project_id}/state", response_model=StagedProjectResponse)
@@ -298,14 +303,19 @@ async def run_project_stream(request: ProjectRunRequest) -> StreamingResponse:
 
 @app.get("/projects", response_model=list[ProjectSummary])
 def list_projects() -> list[dict]:
-    staged = memory_store.list_staged_projects()
-    staged_ids = {project["id"] for project in staged}
-    quick_runs = [
-        {**project, "updated_at": project["created_at"], "current_stage": None, "type": "quick_run"}
-        for project in memory_store.list_projects()
-        if project["id"] not in staged_ids
-    ]
-    return [*staged, *quick_runs][:50]
+    try:
+        staged = memory_store.list_staged_projects()
+        staged_ids = {project["id"] for project in staged}
+        quick_runs = [
+            {**project, "updated_at": project["created_at"], "current_stage": None, "type": "quick_run"}
+            for project in memory_store.list_projects()
+            if project["id"] not in staged_ids
+        ]
+        return [*staged, *quick_runs][:50]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not load project history: {exc}") from exc
 
 
 @app.get("/projects/{project_id}")

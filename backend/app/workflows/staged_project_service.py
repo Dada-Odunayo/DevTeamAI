@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException
@@ -23,9 +24,12 @@ from app.prompts import (
     REVISION_SYSTEM_PROMPT,
 )
 from app.schemas import ProjectCreateRequest
+from app.services.generated_scaffold import default_next_globals_css, default_next_page_tsx, ensure_runnable_generated_files
 from app.services.memory_store import MemoryStore
 from app.services.qwen_client import QwenClient
 from app.services.scoring_service import build_baseline_comparison, detect_conflicts, score_artifacts
+
+STALE_RUNNING_STAGE_AFTER = timedelta(minutes=5)
 
 
 STAGE_DEFINITIONS: list[dict[str, Any]] = [
@@ -63,6 +67,7 @@ def now_iso() -> str:
 
 class StagedProjectService:
     def __init__(self, qwen_client: QwenClient, memory_store: MemoryStore):
+        self.qwen_client = qwen_client
         self.memory_store = memory_store
         self.projects: dict[str, dict[str, Any]] = {}
         self.agents = {
@@ -137,7 +142,10 @@ class StagedProjectService:
         return self._public_project(project)
 
     def get_project(self, project_id: str) -> dict[str, Any]:
-        return self._public_project(self._require_project(project_id))
+        project = self._require_project(project_id)
+        if self._recover_stale_running_stages(project):
+            self._save_project(project)
+        return self._public_project(project)
 
     async def run_stage(self, project_id: str, stage_name: str, feedback: str | None = None) -> dict[str, Any]:
         project = self._require_project(project_id)
@@ -163,7 +171,26 @@ class StagedProjectService:
 
         payload = self._stage_payload(project, stage_name, feedback)
         try:
-            output = await self.agents[stage_name].run(payload, temperature=0.15 if stage_name == "cto_review" else 0.2)
+            output = await self.agents[stage_name].run(
+                payload,
+                temperature=0.15 if stage_name == "cto_review" else 0.2,
+                timeout_seconds=self._stage_timeout_seconds(stage_name),
+            )
+        except asyncio.CancelledError:
+            stage["status"] = "failed"
+            stage["updated_at"] = now_iso()
+            project["updated_at"] = stage["updated_at"]
+            self._add_dialogue(
+                project,
+                stage_name,
+                "System",
+                stage["assigned_agent"],
+                "revision_request",
+                f"{stage_name.replace('_', ' ')} was cancelled before completion and can be retried.",
+                ARTIFACT_STAGE_MAP.get(stage_name, stage_name),
+            )
+            self._save_project(project)
+            raise
         except Exception:
             stage["status"] = "failed"
             stage["updated_at"] = now_iso()
@@ -376,6 +403,42 @@ class StagedProjectService:
     def _is_approved(self, project: dict[str, Any], stage_name: str) -> bool:
         return self._require_stage(project, stage_name)["status"] == "approved"
 
+    def _recover_stale_running_stages(self, project: dict[str, Any]) -> bool:
+        changed = False
+        now = datetime.now(timezone.utc)
+        for stage in project["stages"]:
+            if stage.get("status") != "running":
+                continue
+            updated_at = self._parse_timestamp(stage.get("updated_at"))
+            if updated_at is None or now - updated_at < STALE_RUNNING_STAGE_AFTER:
+                continue
+            stage["status"] = "failed"
+            stage["updated_at"] = now_iso()
+            project["updated_at"] = stage["updated_at"]
+            self._add_dialogue(
+                project,
+                stage["name"],
+                "System",
+                stage["assigned_agent"],
+                "revision_request",
+                f"{stage['name'].replace('_', ' ')} did not complete and was reset so it can be retried.",
+                ARTIFACT_STAGE_MAP.get(stage["name"], stage["name"]),
+            )
+            changed = True
+        return changed
+
+    @staticmethod
+    def _parse_timestamp(value: Any) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
     def _stage_can_run(self, project: dict[str, Any], stage_name: str) -> bool:
         stage = self._require_stage(project, stage_name)
         if stage_name == "negotiation":
@@ -387,6 +450,21 @@ class StagedProjectService:
         if stage_name == "code_review":
             return bool(project["generated_files"])
         return all(self._is_approved(project, dep) for dep in stage["dependencies"])
+
+    def _stage_timeout_seconds(self, stage_name: str) -> int:
+        minimums = {
+            "prd": 210,
+            "decomposition": 150,
+            "architecture": 180,
+            "backend_plan": 180,
+            "frontend_plan": 180,
+            "qa_plan": 180,
+            "cto_review": 180,
+            "revision_summary": 180,
+            "code_generation": 210,
+            "code_review": 180,
+        }
+        return max(self.qwen_client.settings.qwen_timeout_seconds, minimums.get(stage_name, 180))
 
     def _next_unapproved_stage(self, project: dict[str, Any]) -> str | None:
         for definition in STAGE_DEFINITIONS:
@@ -577,7 +655,7 @@ class StagedProjectService:
     def _coerce_generated_files(self, project: dict[str, Any], output: dict[str, Any]) -> list[dict[str, str]]:
         files = output.get("files") if isinstance(output, dict) else None
         if isinstance(files, list) and files:
-            return [
+            coerced = [
                 {
                     "path": str(file.get("path", "README.md")),
                     "language": str(file.get("language", "text")),
@@ -586,7 +664,8 @@ class StagedProjectService:
                 for file in files
                 if isinstance(file, dict)
             ]
-        return self._starter_files(project)
+            return ensure_runnable_generated_files(coerced)
+        return ensure_runnable_generated_files(self._starter_files(project))
 
     def _generated_file(self, project_id: str, file: dict[str, str]) -> dict[str, str]:
         return {
@@ -612,7 +691,16 @@ class StagedProjectService:
             {
                 "path": "README.md",
                 "language": "markdown",
-                "content": f"# {name}\n\nStarter scaffold generated from the approved DevTeam AI plan.\n\n## Run\n\nReview `.env.example`, then start the backend and selected frontend/mobile scaffold.\n",
+                "content": (
+                    f"# {name}\n\n"
+                    "Starter scaffold generated from the approved DevTeam AI plan.\n\n"
+                    "## Run the Next.js app\n\n"
+                    "```bash\n"
+                    "npm install\n"
+                    "npm run dev\n"
+                    "```\n\n"
+                    "Review `.env.example` before connecting the app to backend services.\n"
+                ),
             },
             {
                 "path": "docker-compose.yml",
@@ -646,14 +734,15 @@ class StagedProjectService:
             files.extend(
                 [
                     {
-                        "path": "frontend/package.json",
+                        "path": "package.json",
                         "language": "json",
-                        "content": "{\"scripts\":{\"dev\":\"next dev\"},\"dependencies\":{\"next\":\"latest\",\"react\":\"latest\",\"react-dom\":\"latest\"},\"devDependencies\":{\"typescript\":\"latest\"}}\n",
+                        "content": "{\"private\":true,\"scripts\":{\"dev\":\"next dev\",\"build\":\"next build\",\"start\":\"next start\",\"typecheck\":\"tsc --noEmit\"},\"dependencies\":{\"next\":\"latest\",\"react\":\"latest\",\"react-dom\":\"latest\"},\"devDependencies\":{\"@types/node\":\"latest\",\"@types/react\":\"latest\",\"@types/react-dom\":\"latest\",\"typescript\":\"latest\"}}\n",
                     },
-                    {"path": "frontend/app/layout.tsx", "language": "tsx", "content": "export default function RootLayout({ children }: { children: React.ReactNode }) { return <html><body>{children}</body></html>; }\n"},
-                    {"path": "frontend/app/page.tsx", "language": "tsx", "content": "export default function Page() { return <main>Generated starter UI</main>; }\n"},
-                    {"path": "frontend/lib/api.ts", "language": "typescript", "content": "export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';\n"},
-                    {"path": "frontend/components/README.md", "language": "markdown", "content": "# Components\n\nAdd reusable UI components here.\n"},
+                    {"path": "app/layout.tsx", "language": "tsx", "content": "import './globals.css';\n\nexport default function RootLayout({ children }: { children: React.ReactNode }) { return <html lang=\"en\"><body>{children}</body></html>; }\n"},
+                    {"path": "app/globals.css", "language": "css", "content": default_next_globals_css()},
+                    {"path": "app/page.tsx", "language": "tsx", "content": default_next_page_tsx()},
+                    {"path": "lib/api.ts", "language": "typescript", "content": "export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';\n"},
+                    {"path": "components/README.md", "language": "markdown", "content": "# Components\n\nAdd reusable UI components here.\n"},
                 ]
             )
         if use_kotlin:

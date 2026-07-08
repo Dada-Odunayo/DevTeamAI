@@ -72,6 +72,9 @@ Convert the idea into a buildable MVP, not a marketing brief.
 Separate must-have MVP behavior from future enhancements.
 Capture compliance, audit, security, offline, device, or operational constraints if implied by the request.
 Write user stories that are specific enough for QA to test.
+Keep the PRD compact: at most 3 personas, 5 core features, 8 functional requirements,
+5 non-functional requirements, 6 user stories, 8 acceptance criteria, and 5 items in
+each scope, metric, risk, uncertainty, and assumption list. Keep every list item one sentence.
 
 {JSON_ONLY_RULE}
 {AGENT_COLLABORATION_RULES}
@@ -400,7 +403,10 @@ Your job is to generate a clean starter scaffold only after the user has approve
 Generate file-based output. Prefer simple, runnable starter files over large incomplete code.
 Include README.md, docker-compose.yml, .env.example, database/schema.sql, and openapi.yaml.
 For FastAPI include backend/requirements.txt, backend/app/main.py, backend/app/config.py, backend/app/database.py, backend/app/routes/__init__.py, backend/app/schemas/__init__.py, backend/app/services/__init__.py.
-For Next.js include frontend/package.json, frontend/app/page.tsx, frontend/app/layout.tsx, frontend/lib/api.ts, frontend/components/README.md.
+For Next.js generate a runnable app at the scaffold root: include package.json, app/page.tsx, app/layout.tsx, app/globals.css, lib/api.ts, components/README.md, next.config.js, tsconfig.json, and next-env.d.ts.
+Do not generate package-lock.json unless package.json is also present and consistent.
+The generated UI must be adequately styled and responsive: include a polished app/globals.css with layout, typography, spacing, cards, buttons, forms, and mobile behavior. Use semantic class names and plain CSS unless you also include every dependency and config required by another styling system.
+Do not return a bare, unstyled page such as `<main>Generated starter UI</main>`.
 For Kotlin include mobile/README.md, mobile/app_structure.md, mobile/build.gradle.kts, mobile/core_architecture.md.
 For unsupported stacks generate README and architecture scaffold instead of broken code.
 Use the approved plan as source of truth. Generated code should be small, coherent, and internally consistent.
@@ -434,7 +440,7 @@ Your job is to review generated starter code for missing files, broken imports, 
 
 Be concise and actionable.
 Review the generated code as a starter scaffold, not a production system.
-Prioritize broken imports, missing files, unsafe defaults, contract mismatches, missing env vars, and unclear run instructions.
+Prioritize broken imports, missing package.json or run scripts, missing styling files, bare unstyled screens, missing files, unsafe defaults, contract mismatches, missing env vars, and unclear run instructions.
 If the scaffold is acceptable for a hackathon demo, say so while still listing follow-up improvements.
 
 {JSON_ONLY_RULE}
