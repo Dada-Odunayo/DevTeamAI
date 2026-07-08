@@ -37,6 +37,7 @@ app = FastAPI(
     title="DevTeam AI API",
     description="Qwen-powered multi-agent software delivery team",
     version="0.1.0",
+    root_path="/api",
 )
 
 app.add_middleware(
